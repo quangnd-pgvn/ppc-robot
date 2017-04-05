@@ -12,7 +12,7 @@ $config_db = array(
     'mysql_host' => '127.0.0.1',
     'mysql_db' => 'ppcdemo2',
     'mysql_user' => 'root',
-    'mysql_password' => 'longthan',
+    'mysql_password' => 'abcxyz',
     'mysql_charset' => 'utf8',
 );
 
