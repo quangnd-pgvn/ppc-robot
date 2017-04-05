@@ -1,0 +1,6 @@
+{
+    "require": {
+        "chargebee/chargebee-php": ">=2, <3",
+        "wildbit/postmark-php": "^2.3"
+    }
+}

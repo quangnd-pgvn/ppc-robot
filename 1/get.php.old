@@ -1,0 +1,353 @@
+<?php
+
+set_time_limit(0);
+ini_set("memory_limit", -1);
+
+require_once 'AmazonAdvertisingApi/Client.php';
+
+$fromTime = strtotime(@$_GET['date'] ? $_GET['date'] : $argv['1']);
+$tillTime = time();
+$regions = json_decode(@file_get_contents(__DIR__.'/regions.json'), true);
+
+include 'db.php';
+
+$usersResult = $db->query('SELECT `code`, `country_id`, `user` FROM `mws` WHERE `code` IS NOT NULL');
+
+while($user = $usersResult->fetch(PDO::FETCH_ASSOC)) {
+
+    if(!$regions[$user['country_id']] OR ! strlen(trim($user['code'])))
+        continue;
+
+    $config = array_merge(json_decode(@file_get_contents(__DIR__.'/config.json'), true), array(
+        'refreshToken' => $user['code'],
+        'region' => $regions[$user['country_id']]
+    ));
+    $client = new AmazonAdvertisingApi\Client($config);
+
+    for($reportTime = $fromTime; $reportTime <= $tillTime; $reportTime = $reportTime + 86400) {
+
+        $groups_cached = array();
+        $keywords_cached = array();
+        $products_cached = array();
+        $campaigns_cached = array();
+
+        $profilesResponse = $client->getProfiles();
+        $profilesResponse['response'] = json_decode($profilesResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+        $currentProfile = NULL;
+
+        foreach($profilesResponse['response'] as $profile) {
+            if(strtolower($profile['countryCode']) == $user['country_id']) {
+                $currentProfile = $profile;
+            }
+        }
+
+        if($currentProfile) {
+            $client->profileId = $currentProfile['profileId'];
+
+            $reportsResponse = $client->requestReport('productAds', array(
+                'reportDate' => date('Ymd', $reportTime),
+                'campaignType' => 'sponsoredProducts',
+                'metrics' => 'impressions,clicks,cost,avgImpressionPosition,attributedConversions1dSameSKU,attributedConversions1d,attributedSales1dSameSKU,attributedSales1d,attributedConversions7dSameSKU,attributedConversions7d,attributedSales7dSameSKU,attributedSales7d,attributedConversions30dSameSKU,attributedConversions30d,attributedSales30dSameSKU,attributedSales30d'
+            ));
+
+            $reportsResponse['response'] = json_decode($reportsResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+            if($reportsResponse['success']) {
+
+                $attemps = 0;
+                do {
+                    sleep(20);
+                    $reportResponse = $client->getReport($reportsResponse['response']['reportId']);
+
+                    $reportResponse['response'] = json_decode($reportResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+                } while(!isset($reportResponse['response']['0']) AND $attemps++ < 100);
+
+                include 'db.php';
+
+                if($reportResponse['success'] AND isset($reportResponse['response']['0'])) {
+
+                    foreach($reportResponse['response'] as $report) {
+                        $data = array(
+                            'Start Date' => date('Y-m-d', $reportTime),
+                            'End Date' => date('Y-m-d', $reportTime + 86400),
+                            'Impressions' => $report['impressions'],
+                            'Clicks' => $report['clicks'],
+                            'CTR' => ($report['impressions'] > 0 ? $report['clicks'] / $report['impressions'] : 0) * 100,
+                            'Total Spend' => $report['cost'],
+                            'Average CPC' => $report['clicks'] > 0 ? $report['cost'] / $report['clicks'] : 0,
+                            'Currency' => $currentProfile['currencyCode'],
+                            '1-day Same SKU Units Ordered' => $report['attributedConversions1dSameSKU'],
+                            '1-day Other SKU Units Ordered' => $report['attributedConversions1d'],
+                            '1-day Same SKU Units Ordered Product Sales' => $report['attributedSales1dSameSKU'],
+                            '1-day Other SKU Units Ordered Product Sales' => $report['attributedSales1d'],
+                            '1-day Orders Placed' => $report['attributedConversions1d'],
+                            '1-day Ordered Product Sales' => $report['attributedSales1d'],
+                            '1-week Same SKU Units Ordered' => $report['attributedConversions7dSameSKU'],
+                            '1-week Other SKU Units Ordered' => $report['attributedConversions7d'],
+                            '1-week Same SKU Units Ordered Product Sales' => $report['attributedSales7dSameSKU'],
+                            '1-week Other SKU Units Ordered Product Sales' => $report['attributedSales7d'],
+                            '1-week Orders Placed' => $report['attributedConversions7d'],
+                            '1-week Ordered Product Sales' => $report['attributedSales7d'],
+                            '1-month Same SKU Units Ordered' => $report['attributedConversions30dSameSKU'],
+                            '1-month Other SKU Units Ordered' => $report['attributedConversions30d'],
+                            '1-month Same SKU Units Ordered Product Sales' => $report['attributedSales30dSameSKU'],
+                            '1-month Other SKU Units Ordered Product Sales' => $report['attributedSales30d'],
+                            '1-month Orders Placed' => $report['attributedConversions30d'],
+                            '1-month Ordered Product Sales' => $report['attributedSales30d'],
+                            'user' => $user['user']
+                        );
+
+                        $data['1-day Conversion Rate'] = ($data['1-day Ordered Product Sales'] > 0 ? $data['1-day Ordered Product Sales'] / $data['1-day Ordered Product Sales'] : 0) * 100;
+                        $data['1-week Conversion Rate'] = ($data['1-week Ordered Product Sales'] > 0 ? $data['1-week Ordered Product Sales'] / $data['1-week Ordered Product Sales'] : 0) * 100;
+                        $data['1-month Conversion Rate'] = ($data['1-month Ordered Product Sales'] > 0 ? $data['1-month Ordered Product Sales'] / $data['1-month Ordered Product Sales'] : 0) * 100;
+
+                        if(empty($products_cached[$report['adId']])) {
+                            $productAdsResponse = $client->getProductAd($report['adId']);
+                            $products_cached[$report['adId']] = $productAdsResponse;
+                        }
+                        else
+                            $productAdsResponse = $products_cached[$report['adId']];
+
+                        if($productAdsResponse['success']) {
+                            $productAdsResponse['response'] = json_decode($productAdsResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                            $data['Advertised SKU'] = $productAdsResponse['response']['sku'];
+
+                            if(empty($campaigns_cached[$productAdsResponse['response']['campaignId']])) {
+                                $campaignResponse = $client->getCampaign($productAdsResponse['response']['campaignId']);
+                                $campaigns_cached[$productAdsResponse['response']['campaignId']] = $campaignResponse;
+                            }
+                            else
+                                $campaignResponse = $campaigns_cached[$productAdsResponse['response']['campaignId']];
+
+                            if($campaignResponse['success']) {
+                                $campaignResponse['response'] = json_decode($campaignResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                                $data['Campaign Name'] = $campaignResponse['response']['name'];
+                                $data['Campaign Id'] = $campaignResponse['response']['campaignId'];
+                            }
+
+                            if(empty($groups_cached[$productAdsResponse['response']['adGroupId']])) {
+                                $adGroupResponse = $client->getAdGroup($productAdsResponse['response']['adGroupId']);
+                                $groups_cached[$productAdsResponse['response']['adGroupId']] = $adGroupResponse;
+                            }
+                            else
+                                $adGroupResponse = $groups_cached[$productAdsResponse['response']['adGroupId']];
+
+                            if($adGroupResponse['success']) {
+                                $adGroupResponse['response'] = json_decode($adGroupResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                                $data['Ad Group Name'] = $adGroupResponse['response']['name'];
+                                $data['Ad Group Id'] = $adGroupResponse['response']['adGroupId'];
+                            }
+                        }
+
+                        $result = $db->prepare('REPLACE INTO `productadsreport2` (`'.implode('`, `', array_keys($data)).'`) VALUES (?'.str_repeat(', ?', count($data) - 1).')')->execute(array_values($data));
+
+                    }
+                }
+            }
+
+            $reportsResponse = $client->requestReport('keywords', array(
+                'reportDate' => date('Ymd', $reportTime),
+                //'segment' => 'query',
+                'campaignType' => 'sponsoredProducts',
+                'metrics' => 'impressions,clicks,cost,avgImpressionPosition,attributedConversions1dSameSKU,attributedConversions1d,attributedSales1dSameSKU,attributedSales1d,attributedConversions7dSameSKU,attributedConversions7d,attributedSales7dSameSKU,attributedSales7d,attributedConversions30dSameSKU,attributedConversions30d,attributedSales30dSameSKU,attributedSales30d'
+                ));
+
+            $reportsResponse['response'] = json_decode($reportsResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+            if($reportsResponse['success']) {
+
+                $attemps = 0;
+                do {
+                    sleep(20);
+                    $reportResponse = $client->getReport($reportsResponse['response']['reportId']);
+                    $reportResponse['response'] = json_decode($reportResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+                } while(!isset($reportResponse['response']['0']) AND $attemps++ < 100);
+
+                include 'db.php';
+
+                if($reportResponse['success'] AND isset($reportResponse['response']['0'])) {
+
+                    foreach($reportResponse['response'] as $report) {
+
+                        $data = array(
+                            'Start Date' => date('Y-m-d', $reportTime),
+                            'End Date' => date('Y-m-d', $reportTime + 86400),
+                            'Impressions' => $report['impressions'],
+                            'Clicks' => $report['clicks'],
+                            'CTR' => ($report['impressions'] > 0 ? $report['clicks'] / $report['impressions'] : 0) * 100,
+                            'Total Spend' => $report['cost'],
+                            'Average CPC' => $report['clicks'] > 0 ? $report['cost'] / $report['clicks'] : 0,
+                            'Currency' => $currentProfile['currencyCode'],
+                            '1-day Same SKU Units Ordered' => $report['attributedConversions1dSameSKU'],
+                            '1-day Other SKU Units Ordered' => $report['attributedConversions1d'],
+                            '1-day Same SKU Units Ordered Product Sales' => $report['attributedSales1dSameSKU'],
+                            '1-day Other SKU Units Ordered Product Sales' => $report['attributedSales1d'],
+                            '1-day Orders Placed' => $report['attributedConversions1d'],
+                            '1-day Ordered Product Sales' => $report['attributedSales1d'],
+                            '1-week Same SKU Units Ordered' => $report['attributedConversions7dSameSKU'],
+                            '1-week Other SKU Units Ordered' => $report['attributedConversions7d'],
+                            '1-week Same SKU Units Ordered Product Sales' => $report['attributedSales7dSameSKU'],
+                            '1-week Other SKU Units Ordered Product Sales' => $report['attributedSales7d'],
+                            '1-week Orders Placed' => $report['attributedConversions7d'],
+                            '1-week Ordered Product Sales' => $report['attributedSales7d'],
+                            '1-month Same SKU Units Ordered' => $report['attributedConversions30dSameSKU'],
+                            '1-month Other SKU Units Ordered' => $report['attributedConversions30d'],
+                            '1-month Same SKU Units Ordered Product Sales' => $report['attributedSales30dSameSKU'],
+                            '1-month Other SKU Units Ordered Product Sales' => $report['attributedSales30d'],
+                            '1-month Orders Placed' => $report['attributedConversions30d'],
+                            '1-month Ordered Product Sales' => $report['attributedSales30d'],
+                            'user' => $user['user']
+                        );
+
+                        $data['1-day Conversion Rate'] = ($data['1-day Ordered Product Sales'] > 0 ? $data['1-day Ordered Product Sales'] / $data['1-day Ordered Product Sales'] : 0) * 100;
+                        $data['1-week Conversion Rate'] = ($data['1-week Ordered Product Sales'] > 0 ? $data['1-week Ordered Product Sales'] / $data['1-week Ordered Product Sales'] : 0) * 100;
+                        $data['1-month Conversion Rate'] = ($data['1-month Ordered Product Sales'] > 0 ? $data['1-month Ordered Product Sales'] / $data['1-month Ordered Product Sales'] : 0) * 100;
+
+                        if(empty($keywords_cached[$report['keywordId']])) {
+                            $keywordResponse = $client->getBiddableKeyword($report['keywordId']);
+                            $keywords_cached[$report['keywordId']] = $keywordResponse;
+                        }
+                        else
+                            $keywordResponse = $keywords_cached[$report['keywordId']];
+
+                        if($keywordResponse['success']) {
+                            $keywordResponse['response'] = json_decode($keywordResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                            $data['Keyword'] = $keywordResponse['response']['keywordText'];
+                            $data['Match Type'] = $keywordResponse['response']['matchType'];
+
+                            if(empty($campaigns_cached[$keywordResponse['response']['campaignId']])) {
+                                $campaignResponse = $client->getCampaign($keywordResponse['response']['campaignId']);
+                                $campaigns_cached[$keywordResponse['response']['campaignId']] = $campaignResponse;
+                            }
+                            else
+                                $campaignResponse = $campaigns_cached[$keywordResponse['response']['campaignId']];
+
+                            if($campaignResponse['success']) {
+                                $campaignResponse['response'] = json_decode($campaignResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                                $data['Campaign Name'] = $campaignResponse['response']['name'];
+                                $data['Campaign Id'] = $campaignResponse['response']['campaignId'];
+                            }
+
+                            if(empty($groups_cached[$keywordResponse['response']['adGroupId']])) {
+                                $adGroupResponse = $client->getAdGroup($keywordResponse['response']['adGroupId']);
+                                $groups_cached[$keywordResponse['response']['adGroupId']] = $adGroupResponse;
+                            }
+                            else
+                                $adGroupResponse = $groups_cached[$keywordResponse['response']['adGroupId']];
+
+                            if($adGroupResponse['success']) {
+                                $adGroupResponse['response'] = json_decode($adGroupResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                                $data['Ad Group Name'] = $adGroupResponse['response']['name'];
+                                $data['Ad Group Id'] = $adGroupResponse['response']['adGroupId'];
+                            }
+                        }
+
+                        $db->prepare('REPLACE INTO `keywordsreport2` (`'.implode('`, `', array_keys($data)).'`) VALUES (?'.str_repeat(', ?', count($data) - 1).')')->execute(array_values($data));
+                    }
+                }
+            }
+
+            $reportsResponse = $client->requestReport('keywords', array(
+                'reportDate' => date('Ymd', $reportTime),
+                'segment' => 'query',
+                'campaignType' => 'sponsoredProducts',
+                'metrics' => 'impressions,clicks,cost,avgImpressionPosition,attributedConversions1dSameSKU,attributedConversions1d,attributedSales1dSameSKU,attributedSales1d,attributedConversions7dSameSKU,attributedConversions7d,attributedSales7dSameSKU,attributedSales7d,attributedConversions30dSameSKU,attributedConversions30d,attributedSales30dSameSKU,attributedSales30d'
+                ));
+
+            $reportsResponse['response'] = json_decode($reportsResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+            if($reportsResponse['success']) {
+
+                $attemps = 0;
+                do {
+                    sleep(20);
+                    $reportResponse = $client->getReport($reportsResponse['response']['reportId']);
+                    $reportResponse['response'] = json_decode($reportResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+                } while(!isset($reportResponse['response']['0']) AND $attemps++ < 100);
+
+                include 'db.php';
+
+                if($reportResponse['success'] AND isset($reportResponse['response']['0'])) {
+
+                    foreach($reportResponse['response'] as $report) {
+
+                        $data = array(
+                            'Customer Search Term' => $report['query'],
+                            'First Day of Impression' => date('Y-m-d', $reportTime),
+                            'Last Day of Impression' => date('Y-m-d', $reportTime + 86400),
+                            'Impressions' => $report['impressions'],
+                            'Clicks' => $report['clicks'],
+                            'CTR' => ($report['impressions'] > 0 ? $report['clicks'] / $report['impressions'] : 0) * 100,
+                            'Total Spend' => $report['cost'],
+                            'Average CPC' => $report['clicks'] > 0 ? $report['cost'] / $report['clicks'] : 0,
+                            'Currency' => $currentProfile['currencyCode'],
+                            'Same SKU units Ordered within 1-week of click' => $report['attributedConversions7dSameSKU'],
+                            'Other SKU units Ordered within 1-week of click' => $report['attributedConversions7d'],
+                            'Same SKU units Product Sales within 1-week of click' => $report['attributedSales7dSameSKU'],
+                            'Other SKU units Product Sales within 1-week of click' => $report['attributedSales7d'],
+                            'Orders placed within 1-week of a click' => $report['attributedConversions7d'],
+                            'Product Sales within 1-week of a click' => $report['attributedSales7d'],
+                            'user' => $user['user']
+                        );
+
+                        $data['ACoS'] = ($data['Product Sales within 1-week of a click'] > 0 ? $data['Total Spend'] / $data['Product Sales within 1-week of a click'] : 0) * 100;
+                        $data['Conversion Rate within 1-week of a click'] = ($data['Product Sales within 1-week of a click'] > 0 ? $data['Orders placed within 1-week of a click'] / $data['Product Sales within 1-week of a click'] : 0) * 100;
+
+                        if(empty($keywords_cached[$report['keywordId']])) {
+                            $keywordResponse = $client->getBiddableKeyword($report['keywordId']);
+                            $keywords_cached[$report['keywordId']] = $keywordResponse;
+                        }
+                        else
+                            $keywordResponse = $keywords_cached[$report['keywordId']];
+
+                        if($keywordResponse['success']) {
+                            $keywordResponse['response'] = json_decode($keywordResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                            $data['Keyword'] = $keywordResponse['response']['keywordText'];
+                            $data['Match Type'] = $keywordResponse['response']['matchType'];
+
+                            if(empty($campaigns_cached[$keywordResponse['response']['campaignId']])) {
+                                $campaignResponse = $client->getCampaign($keywordResponse['response']['campaignId']);
+                                $campaigns_cached[$keywordResponse['response']['campaignId']] = $campaignResponse;
+                            }
+                            else
+                                $campaignResponse = $campaigns_cached[$keywordResponse['response']['campaignId']];
+
+                            if($campaignResponse['success']) {
+                                $campaignResponse['response'] = json_decode($campaignResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                                $data['Campaign Name'] = $campaignResponse['response']['name'];
+                            }
+
+                            if(empty($groups_cached[$keywordResponse['response']['adGroupId']])) {
+                                $adGroupResponse = $client->getAdGroup($keywordResponse['response']['adGroupId']);
+                                $groups_cached[$keywordResponse['response']['adGroupId']] = $adGroupResponse;
+                            }
+                            else
+                                $adGroupResponse = $groups_cached[$keywordResponse['response']['adGroupId']];
+
+                            if($adGroupResponse['success']) {
+                                $adGroupResponse['response'] = json_decode($adGroupResponse['response'], true, 512, JSON_BIGINT_AS_STRING);
+
+                                $data['Ad Group Name'] = $adGroupResponse['response']['name'];
+                            }
+                        }
+
+                        $db->prepare('REPLACE INTO `searchtermreport2` (`'.implode('`, `', array_keys($data)).'`) VALUES (?'.str_repeat(', ?', count($data) - 1).')')->execute(array_values($data));
+                    }
+                }
+            }
+        }
+        else {
+            echo "Can't find a profile";
+            print_r($profilesResponse);
+        }
+    }
+}    
