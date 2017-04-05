@@ -1,13 +1,4 @@
 <?php
-
-// $config_db = array(
-//     'mysql_host' => 'ppcentourage.cluster-cqcfefpm2ww2.us-west-2.rds.amazonaws.com',
-//     'mysql_db' => 'test',
-//     'mysql_user' => 'entourage',
-//     'mysql_password' => 'ENTO_Ppc2016',
-//     'mysql_charset' => 'utf8',
-// );
-
 $config_db = array(
     'mysql_host' => '127.0.0.1',
     'mysql_db' => 'ppcdemo2',
